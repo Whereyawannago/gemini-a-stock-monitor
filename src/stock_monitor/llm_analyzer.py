@@ -5,12 +5,20 @@ from __future__ import annotations
 import logging
 import re
 import time
-from typing import Optional
+from typing import Callable, List, Optional
 
 from openai import OpenAI
 
 from .config import Settings
-from .models import AlertLevel, AlertResult, AnalysisResult, MarketSnapshot
+from .models import (
+    AlertLevel,
+    AlertResult,
+    AnalysisResult,
+    DailyReview,
+    GoldAlert,
+    GoldSnapshot,
+    MarketSnapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -224,30 +232,30 @@ class MiniMaxAnalyzer:
             )
         return self._client
 
-    def analyze(
+    def analyze_with_prompt(
         self,
-        snapshot: MarketSnapshot,
-        alert: AlertResult,
+        system_prompt: str,
+        user_prompt: str,
+        fallback_fn: Callable[[], str],
     ) -> AnalysisResult:
-        """Generate 4-section intraday commentary via MiniMax or rule fallback."""
+        """Call MiniMax with arbitrary system/user prompts, falling back on error."""
         start = time.monotonic()
         if not self.settings.minimax_api_key and self._client is None:
             logger.info("MINIMAX_API_KEY 未配置，自动降级为规则摘要")
             return AnalysisResult(
-                content=build_rule_based_summary(snapshot, alert),
+                content=fallback_fn(),
                 source="rule_fallback",
                 model="rule_engine",
                 latency_ms=int((time.monotonic() - start) * 1000),
                 error="MINIMAX_API_KEY not configured",
             )
 
-        user_prompt = format_snapshot_for_prompt(snapshot, alert)
         try:
             client = self._get_client()
             response = client.chat.completions.create(
                 model=self.settings.minimax_model,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 max_tokens=self.settings.minimax_max_tokens,
@@ -260,7 +268,9 @@ class MiniMaxAnalyzer:
 
             cleaned = strip_think_tags(raw_content)
             if not cleaned:
-                raise ValueError("MiniMax returned empty content after stripping <think> tags")
+                raise ValueError(
+                    "MiniMax returned empty content after stripping <think> tags"
+                )
 
             return AnalysisResult(
                 content=cleaned,
@@ -271,9 +281,51 @@ class MiniMaxAnalyzer:
         except Exception as exc:  # noqa: BLE001
             logger.warning("MiniMax 调用失败或超时，自动降级为规则摘要: %s", exc)
             return AnalysisResult(
-                content=build_rule_based_summary(snapshot, alert),
+                content=fallback_fn(),
                 source="rule_fallback",
                 model="rule_engine",
                 latency_ms=int((time.monotonic() - start) * 1000),
                 error=str(exc),
             )
+
+    def analyze(
+        self,
+        snapshot: MarketSnapshot,
+        alert: AlertResult,
+    ) -> AnalysisResult:
+        """Generate 4-section intraday commentary via MiniMax or rule fallback."""
+        return self.analyze_with_prompt(
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=format_snapshot_for_prompt(snapshot, alert),
+            fallback_fn=lambda: build_rule_based_summary(snapshot, alert),
+        )
+
+    def analyze_review(self, review: DailyReview) -> AnalysisResult:
+        """Generate 4-section post-close A-share review commentary."""
+        from .daily_review import (
+            REVIEW_SYSTEM_PROMPT,
+            build_rule_review_summary,
+            format_review_prompt,
+        )
+
+        return self.analyze_with_prompt(
+            system_prompt=REVIEW_SYSTEM_PROMPT,
+            user_prompt=format_review_prompt(review),
+            fallback_fn=lambda: build_rule_review_summary(review),
+        )
+
+    def analyze_gold(
+        self, snapshot: GoldSnapshot, alerts: List[GoldAlert]
+    ) -> AnalysisResult:
+        """Generate concise 3-section gold market commentary."""
+        from .gold_monitor import (
+            GOLD_SYSTEM_PROMPT,
+            build_rule_gold_summary,
+            format_gold_prompt,
+        )
+
+        return self.analyze_with_prompt(
+            system_prompt=GOLD_SYSTEM_PROMPT,
+            user_prompt=format_gold_prompt(snapshot, alerts),
+            fallback_fn=lambda: build_rule_gold_summary(snapshot, alerts),
+        )

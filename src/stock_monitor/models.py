@@ -49,6 +49,7 @@ class MarketBreadth:
     limit_up: int = 0
     limit_down: int = 0
     total_turnover: Optional[float] = None  # 两市/全市场成交额（元）
+    activity_pct: Optional[float] = None  # 乐咕乐股市场活跃度 (%)
 
     @property
     def total(self) -> int:
@@ -128,3 +129,162 @@ class AnalysisResult:
     model: str = ""
     latency_ms: int = 0
     error: Optional[str] = None
+
+
+# ====================================================================== #
+# 收盘复盘 (Daily close review)
+# ====================================================================== #
+@dataclass
+class LimitStockItem:
+    """A limit-up / limit-down / hot-rank stock entry."""
+
+    code: str
+    name: str
+    change_pct: float = 0.0
+    boards: int = 0  # 连板数 / 连续跌停
+    industry: str = ""
+    extra: str = ""  # 封板资金 / 人气排名等补充信息
+
+
+@dataclass
+class LimitPoolStats:
+    """涨停板生态：涨停 / 炸板 / 跌停 / 连板高度 / 封板率 / 昨日涨停溢价."""
+
+    limit_up_count: int = 0
+    broken_count: int = 0  # 炸板
+    limit_down_count: int = 0
+    max_boards: int = 0  # 最高连板
+    seal_rate: Optional[float] = None  # 封板率 = 涨停 / (涨停 + 炸板)
+    prev_limit_up_avg_pct: Optional[float] = None  # 昨日涨停今日平均涨幅 (%)
+    board_ladder: List[LimitStockItem] = field(default_factory=list)  # 连板梯队
+    top_industries: List[str] = field(default_factory=list)  # 涨停集中行业, e.g. "半导体(8)"
+    available: bool = False
+
+
+@dataclass
+class CapitalFlowOverview:
+    """大盘资金 / 沪深港通 / 两融."""
+
+    main_net_inflow: Optional[float] = None  # 两市主力净流入（亿元）
+    main_net_inflow_source: str = ""  # 东方财富 / 同花顺行业汇总
+    southbound_net_buy: Optional[float] = None  # 南向成交净买额（亿元）
+    northbound_note: str = "北向资金自2024年8月起不再披露实时净买入"
+    margin_balance: Optional[float] = None  # 沪市两融余额（亿元，T-1）
+    margin_change: Optional[float] = None  # 两融余额较前一日变化（亿元）
+    margin_date: str = ""
+
+
+@dataclass
+class SentimentScore:
+    """0~100 market sentiment (heat) score with component breakdown."""
+
+    score: float
+    label: str
+    components: List[str] = field(default_factory=list)
+
+
+@dataclass
+class DailyReview:
+    """Complete post-close A-share review data."""
+
+    trade_date: str
+    timestamp: datetime
+    market: MarketSnapshot  # 收盘时的指数 / 涨跌家数 / 双维度板块资金
+    limit_pool: LimitPoolStats
+    capital: CapitalFlowOverview
+    hot_stocks: List[LimitStockItem]
+    sentiment: SentimentScore
+    is_mock: bool = False
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class LhbItem:
+    """Dragon-tiger list (龙虎榜) entry."""
+
+    code: str
+    name: str
+    change_pct: float
+    net_buy: float  # 龙虎榜净买额（亿元）
+    reason: str = ""
+    interpretation: str = ""
+
+
+@dataclass
+class LhbReview:
+    """Post-close dragon-tiger list summary (published ~17:00)."""
+
+    trade_date: str
+    timestamp: datetime
+    total_count: int
+    institution_buy_count: int
+    net_buy_top: List[LhbItem] = field(default_factory=list)
+    net_sell_top: List[LhbItem] = field(default_factory=list)
+    is_mock: bool = False
+    warnings: List[str] = field(default_factory=list)
+
+
+# ====================================================================== #
+# 黄金监控 (Gold monitor)
+# ====================================================================== #
+class GoldAlertType(str, Enum):
+    FAST_UP = "fast_up"  # 30分钟急涨
+    FAST_DOWN = "fast_down"  # 30分钟急跌
+    DAILY_UP = "daily_up"  # 日内涨幅超阈值
+    DAILY_DOWN = "daily_down"  # 日内跌幅超阈值
+    LEVEL_ABOVE = "level_above"  # 向上突破关键价位
+    LEVEL_BELOW = "level_below"  # 向下跌破关键价位
+
+
+@dataclass
+class GoldQuote:
+    """Single gold instrument quote."""
+
+    key: str  # AU9999 / COMEX / LONDON
+    name: str
+    price: float
+    unit: str  # 元/克 / 美元/盎司
+    prev_close: Optional[float] = None
+    change_pct: Optional[float] = None  # 较昨收/昨结 (%)
+    high: Optional[float] = None
+    low: Optional[float] = None
+    cny_per_gram: Optional[float] = None  # 折合人民币/克
+    change_30m_pct: Optional[float] = None  # 近30分钟涨跌幅 (%)
+    quote_time: str = ""
+
+
+@dataclass
+class GoldSnapshot:
+    timestamp: datetime
+    quotes: List[GoldQuote]
+    usd_cny: Optional[float] = None
+    premium_cny_per_gram: Optional[float] = None  # 上海金 - 伦敦金折算价
+    is_mock: bool = False
+    warnings: List[str] = field(default_factory=list)
+
+    def get(self, key: str) -> Optional[GoldQuote]:
+        for q in self.quotes:
+            if q.key == key:
+                return q
+        return None
+
+
+@dataclass
+class GoldAlert:
+    alert_type: GoldAlertType
+    key: str
+    message: str
+    dedupe_key: str  # 冷却去重键
+
+
+@dataclass
+class PriceLevel:
+    """User-defined key price level, e.g. AU9999 below 750."""
+
+    key: str
+    direction: str  # "above" / "below"
+    price: float
+
+    @property
+    def id(self) -> str:
+        return f"{self.key}:{self.direction}:{self.price:g}"

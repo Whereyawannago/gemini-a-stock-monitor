@@ -9,7 +9,7 @@ description = "A股半小时智能盯盘程序：AKShare实时监控、量化预
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "akshare>=1.14.0",
+    "akshare>=1.20.45",
     "pandas>=2.1.0",
     "numpy>=1.26.0",
     "openai>=1.40.0",

@@ -9,6 +9,8 @@ from typing import Tuple
 
 from dotenv import load_dotenv
 
+from .models import PriceLevel
+
 
 @dataclass(frozen=True)
 class IndexSpec:
@@ -59,6 +61,61 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.getenv(key)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def parse_time_list(raw: str) -> Tuple[Tuple[int, int], ...]:
+    """Parse "09:30,21:00" into ((9, 30), (21, 0)); invalid items are skipped."""
+    result = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            hh, mm = part.split(":")
+            h, m = int(hh), int(mm)
+        except ValueError:
+            continue
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            result.append((h, m))
+    return tuple(result)
+
+
+def _env_time_list(
+    key: str, default: Tuple[Tuple[int, int], ...]
+) -> Tuple[Tuple[int, int], ...]:
+    raw = os.getenv(key)
+    if raw is None or raw.strip() == "":
+        return default
+    parsed = parse_time_list(raw)
+    return parsed or default
+
+
+def parse_price_levels(raw: str) -> Tuple[PriceLevel, ...]:
+    """Parse "AU9999:below:750,COMEX:above:3700" into PriceLevel tuples."""
+    levels = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        pieces = [p.strip() for p in part.split(":")]
+        if len(pieces) != 3:
+            continue
+        key, direction, price = pieces
+        direction = direction.lower()
+        if direction not in {"above", "below"}:
+            continue
+        try:
+            levels.append(PriceLevel(key=key.upper(), direction=direction, price=float(price)))
+        except ValueError:
+            continue
+    return tuple(levels)
+
+
 @dataclass
 class Settings:
     """Runtime settings for the A-share monitor."""
@@ -93,6 +150,24 @@ class Settings:
     indices: Tuple[IndexSpec, ...] = DEFAULT_INDICES
     schedule_times: Tuple[Tuple[int, int], ...] = DEFAULT_SCHEDULE_TIMES
 
+    # Feature toggles
+    enable_intraday_monitor: bool = True
+    enable_daily_review: bool = True
+    enable_lhb_review: bool = True
+    enable_gold_monitor: bool = True
+
+    # Daily close review (交易日)
+    review_time: Tuple[int, int] = (15, 30)
+    lhb_time: Tuple[int, int] = (18, 0)
+
+    # Gold monitor
+    gold_brief_times: Tuple[Tuple[int, int], ...] = ((9, 30), (21, 0))
+    gold_poll_minutes: int = 5
+    gold_alert_30m_pct: float = 1.0
+    gold_alert_daily_pct: float = 2.0
+    gold_cooldown_minutes: int = 60
+    gold_price_levels: Tuple[PriceLevel, ...] = ()
+
     @property
     def alert_state_file(self) -> Path:
         return self.state_dir / "alert_state.json"
@@ -100,6 +175,10 @@ class Settings:
     @property
     def trade_calendar_cache_file(self) -> Path:
         return self.state_dir / "trade_calendar_cache.json"
+
+    @property
+    def gold_state_file(self) -> Path:
+        return self.state_dir / "gold_state.json"
 
     @classmethod
     def from_env(cls, env_file: str | Path | None = None) -> "Settings":
@@ -136,4 +215,16 @@ class Settings:
             state_dir=Path(os.getenv("STATE_DIR", "./data").strip() or "./data"),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
             sector_top_n=_env_int("SECTOR_TOP_N", 5),
+            enable_intraday_monitor=_env_bool("ENABLE_INTRADAY_MONITOR", True),
+            enable_daily_review=_env_bool("ENABLE_DAILY_REVIEW", True),
+            enable_lhb_review=_env_bool("ENABLE_LHB_REVIEW", True),
+            enable_gold_monitor=_env_bool("ENABLE_GOLD_MONITOR", True),
+            review_time=_env_time_list("REVIEW_TIME", ((15, 30),))[0],
+            lhb_time=_env_time_list("LHB_TIME", ((18, 0),))[0],
+            gold_brief_times=_env_time_list("GOLD_BRIEF_TIMES", ((9, 30), (21, 0))),
+            gold_poll_minutes=max(1, _env_int("GOLD_POLL_MINUTES", 5)),
+            gold_alert_30m_pct=_env_float("GOLD_ALERT_30M_PCT", 1.0),
+            gold_alert_daily_pct=_env_float("GOLD_ALERT_DAILY_PCT", 2.0),
+            gold_cooldown_minutes=_env_int("GOLD_COOLDOWN_MINUTES", 60),
+            gold_price_levels=parse_price_levels(os.getenv("GOLD_PRICE_LEVELS", "")),
         )

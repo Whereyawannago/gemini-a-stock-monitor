@@ -89,10 +89,11 @@ class TradingCalendar:
 
     def _fetch_from_akshare(self) -> Set[str]:
         try:
-            import akshare as ak
             import pandas as pd
 
-            df = ak.tool_trade_date_hist_sina()
+            from .ak_compat import ak_call
+
+            df = ak_call("calendar_trade_date_hist_sina")
             if df is None or df.empty:
                 return set()
             col = "trade_date" if "trade_date" in df.columns else df.columns[0]

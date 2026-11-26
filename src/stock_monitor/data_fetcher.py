@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
+from .ak_compat import ak_call, is_rate_limit_error
 from .config import IndexSpec, Settings
 from .models import (
     IndexSnapshot,
@@ -24,6 +25,9 @@ from .models import (
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
+# 深证综指：与上证指数成交额相加近似两市全市场成交额
+SZ_COMPOSITE_CODE = "399106"
+
 
 def _retry(
     func: Callable[[], T],
@@ -31,7 +35,11 @@ def _retry(
     delay: float = 1.5,
     label: str = "akshare_call",
 ) -> T:
-    """Execute a callable with simple linear backoff retries."""
+    """Execute a callable with simple linear backoff retries.
+
+    Rate-limit errors are never retried: hammering Eastmoney during an IP ban
+    only extends the ban, so the caller should switch to a fallback source.
+    """
     last_exc: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
@@ -41,6 +49,8 @@ def _retry(
             logger.warning(
                 "%s failed (attempt %d/%d): %s", label, attempt, retries, exc
             )
+            if is_rate_limit_error(exc):
+                break
             if attempt < retries:
                 time.sleep(delay * attempt)
     assert last_exc is not None
@@ -237,9 +247,21 @@ def split_latest_two_trading_days(
         prev_df = pd.DataFrame(columns=kline_df.columns)
     return today_df, prev_df
 
-
 class AKShareDataFetcher:
-    """Fetches real-time A-share indices, 5m K-lines, breadth, and sector flows."""
+    """Fetches real-time A-share indices, 5m K-lines, breadth, and sector flows.
+
+    Every data point has a primary source plus a non-Eastmoney fallback so a
+    temporary Eastmoney push2 IP ban never empties the report:
+
+    ============== ============================= ===============================
+    数据            主数据源                        备用数据源
+    ============== ============================= ===============================
+    指数实时行情     东方财富 index_zh_spot_em       新浪 index_zh_spot_sina
+    5分钟K线        东方财富 index_zh_hist_min_em   新浪 stock_zh_a_hist_min_sina
+    涨跌家数        乐咕乐股 stock_market_activity   东方财富 stock_zh_a_spot_em
+    板块资金流向     东方财富 sector_rank_em          同花顺 industry/concept_ths
+    ============== ============================= ===============================
+    """
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -247,18 +269,18 @@ class AKShareDataFetcher:
 
     def fetch_snapshot(self) -> MarketSnapshot:
         """Collect a complete intraday MarketSnapshot from AKShare."""
-        import akshare as ak  # Lazy import so offline tests don't require network
-
         now = datetime.now(self.tz)
         warnings: List[str] = []
 
-        spot_map = self._fetch_index_spot_map(ak, warnings)
+        spot_map = self.fetch_index_spot_map(warnings)
         indices: List[IndexSnapshot] = []
         for spec in self.settings.indices:
-            indices.append(self._build_index_snapshot(ak, spec, spot_map, now, warnings))
+            indices.append(self._build_index_snapshot(spec, spot_map, now, warnings))
 
-        breadth = self._fetch_market_breadth(ak, warnings)
-        sector_flows = self._fetch_sector_flows(ak, warnings)
+        breadth = self.fetch_market_breadth(warnings)
+        if breadth.total_turnover is None:
+            breadth.total_turnover = self._estimate_total_turnover(spot_map)
+        sector_flows = self.fetch_sector_flows(warnings)
 
         return MarketSnapshot(
             timestamp=now,
@@ -269,20 +291,39 @@ class AKShareDataFetcher:
             warnings=warnings,
         )
 
-    def _fetch_index_spot_map(
-        self, ak: object, warnings: List[str]
-    ) -> dict[str, dict[str, float]]:
-        """Fetch real-time quotes for tracked indices via Eastmoney (Sina fallback)."""
+    # ------------------------------------------------------------------ #
+    # 指数实时行情
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _spot_row_to_dict(row: pd.Series) -> dict[str, float]:
+        return {
+            "latest_price": _to_float(row.get("最新价")),
+            "prev_close": _to_float(row.get("昨收")),
+            "change_amount": _to_float(row.get("涨跌额")),
+            "change_pct": _to_float(row.get("涨跌幅")),
+            "today_volume": _to_float(row.get("成交量")),
+            "today_amount": _to_float(row.get("成交额")),
+        }
+
+    def fetch_index_spot_map(self, warnings: List[str]) -> dict[str, dict[str, float]]:
+        """Fetch real-time quotes for tracked indices (Eastmoney -> Sina fallback).
+
+        Keys are bare 6-digit codes. Sina returns prefixed codes (``sh000001``),
+        which are matched against each IndexSpec.symbol to avoid collisions
+        between Shanghai indices and Shenzhen stocks sharing the same digits.
+        """
         spot_map: dict[str, dict[str, float]] = {}
-        target_codes = {spec.code for spec in self.settings.indices}
+        symbol_to_code = {spec.symbol: spec.code for spec in self.settings.indices}
+        symbol_to_code[f"sz{SZ_COMPOSITE_CODE}"] = SZ_COMPOSITE_CODE
+        target_codes = set(symbol_to_code.values())
 
         try:
             frames = []
             for group in ("上证系列指数", "深证系列指数"):
                 df = _retry(
-                    lambda g=group: ak.stock_zh_index_spot_em(symbol=g),  # type: ignore[attr-defined]
+                    lambda g=group: ak_call("index_zh_spot_em", symbol=g),
                     retries=2,
-                    label=f"index_spot_em({group})",
+                    label=f"index_zh_spot_em({group})",
                 )
                 if df is not None and not df.empty:
                     frames.append(df)
@@ -291,48 +332,76 @@ class AKShareDataFetcher:
                 for _, row in merged.iterrows():
                     code = str(row.get("代码", "")).strip()
                     if code in target_codes:
-                        spot_map[code] = {
-                            "latest_price": _to_float(row.get("最新价")),
-                            "prev_close": _to_float(row.get("昨收")),
-                            "change_amount": _to_float(row.get("涨跌额")),
-                            "change_pct": _to_float(row.get("涨跌幅")),
-                            "today_volume": _to_float(row.get("成交量")),
-                            "today_amount": _to_float(row.get("成交额")),
-                        }
+                        spot_map[code] = self._spot_row_to_dict(row)
         except Exception as exc:  # noqa: BLE001
-            warnings.append(f"东方财富指数实时行情获取异常，尝试新浪备用源: {exc}")
-            logger.warning("Eastmoney index spot failed: %s", exc)
+            logger.warning("Eastmoney index spot failed, fallback to Sina: %s", exc)
 
-        # Fallback to Sina for any missing index
         missing = target_codes - set(spot_map.keys())
         if missing:
             try:
                 sina_df = _retry(
-                    lambda: ak.stock_zh_index_spot_sina(),  # type: ignore[attr-defined]
+                    lambda: ak_call("index_zh_spot_sina"),
                     retries=2,
-                    label="index_spot_sina",
+                    label="index_zh_spot_sina",
                 )
                 for _, row in sina_df.iterrows():
-                    raw_code = str(row.get("代码", "")).strip()
-                    digits = re.sub(r"^\D+", "", raw_code)
-                    if digits in missing:
-                        spot_map[digits] = {
-                            "latest_price": _to_float(row.get("最新价")),
-                            "prev_close": _to_float(row.get("昨收")),
-                            "change_amount": _to_float(row.get("涨跌额")),
-                            "change_pct": _to_float(row.get("涨跌幅")),
-                            "today_volume": _to_float(row.get("成交量")),
-                            "today_amount": _to_float(row.get("成交额")),
-                        }
+                    raw_code = str(row.get("代码", "")).strip().lower()
+                    code = symbol_to_code.get(raw_code)
+                    if code is None and raw_code.isdigit():
+                        code = raw_code if raw_code in missing else None
+                    if code in missing:
+                        spot_map[code] = self._spot_row_to_dict(row)
             except Exception as exc:  # noqa: BLE001
-                warnings.append(f"新浪指数实时行情获取失败: {exc}")
+                warnings.append(f"指数实时行情（东方财富/新浪）均获取失败: {exc}")
                 logger.error("Sina index spot fallback failed: %s", exc)
 
         return spot_map
 
+    @staticmethod
+    def _estimate_total_turnover(spot_map: dict[str, dict[str, float]]) -> Optional[float]:
+        """上证指数成交额 + 深证综指成交额 ≈ 沪深两市成交额（元）."""
+        sh = spot_map.get("000001", {}).get("today_amount", 0.0)
+        sz = spot_map.get(SZ_COMPOSITE_CODE, {}).get("today_amount", 0.0)
+        total = sh + sz
+        return total if total > 0 else None
+
+    # ------------------------------------------------------------------ #
+    # 5 分钟 K 线
+    # ------------------------------------------------------------------ #
+    def fetch_5m_kline(self, spec: IndexSpec, now: datetime) -> pd.DataFrame:
+        """Fetch multi-day 5m K-lines (Eastmoney -> Sina fallback), normalized."""
+        start_dt = (now - timedelta(days=10)).strftime("%Y-%m-%d 09:30:00")
+        end_dt = now.strftime("%Y-%m-%d 15:05:00")
+        try:
+            raw = _retry(
+                lambda: ak_call(
+                    "index_zh_hist_min_em",
+                    symbol=spec.code,
+                    period="5",
+                    start_date=start_dt,
+                    end_date=end_dt,
+                ),
+                retries=2,
+                label=f"index_zh_hist_min_em({spec.code})",
+            )
+            norm = normalize_kline_df(raw)
+            if not norm.empty:
+                return norm
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Eastmoney 5m kline failed for %s: %s", spec.code, exc)
+
+        raw = _retry(
+            lambda: ak_call("stock_zh_a_hist_min_sina", symbol=spec.symbol, period="5"),
+            retries=2,
+            label=f"stock_zh_a_hist_min_sina({spec.symbol})",
+        )
+        norm = normalize_kline_df(raw)
+        # Sina may return ~3 months of bars; keep only the recent window
+        cutoff = pd.Timestamp((now - timedelta(days=10)).date())
+        return norm[norm["datetime"] >= cutoff].reset_index(drop=True)
+
     def _build_index_snapshot(
         self,
-        ak: object,
         spec: IndexSpec,
         spot_map: dict[str, dict[str, float]],
         now: datetime,
@@ -340,25 +409,12 @@ class AKShareDataFetcher:
     ) -> IndexSnapshot:
         """Build a single IndexSnapshot combining spot quote and 5-minute K-lines."""
         spot = spot_map.get(spec.code, {})
-        start_dt = (now - timedelta(days=10)).strftime("%Y-%m-%d 09:30:00")
-        end_dt = now.strftime("%Y-%m-%d 15:05:00")
-
         today_df = pd.DataFrame()
         prev_df = pd.DataFrame()
         data_note = ""
 
         try:
-            raw_kline = _retry(
-                lambda: ak.index_zh_a_hist_min_em(  # type: ignore[attr-defined]
-                    symbol=spec.code,
-                    period="5",
-                    start_date=start_dt,
-                    end_date=end_dt,
-                ),
-                retries=2,
-                label=f"5m_kline({spec.code})",
-            )
-            norm = normalize_kline_df(raw_kline)
+            norm = self.fetch_5m_kline(spec, now)
             today_df, prev_df = split_latest_two_trading_days(norm)
         except Exception as exc:  # noqa: BLE001
             data_note = f"5m K线缺失: {exc}"
@@ -418,38 +474,44 @@ class AKShareDataFetcher:
             data_note=data_note,
         )
 
-    def _fetch_market_breadth(
-        self, ak: object, warnings: List[str]
-    ) -> MarketBreadth:
-        """Compute whole-market advance/decline counts and total turnover."""
+    # ------------------------------------------------------------------ #
+    # 涨跌家数
+    # ------------------------------------------------------------------ #
+    def fetch_market_breadth(self, warnings: List[str]) -> MarketBreadth:
+        """Whole-market advance/decline counts (Legu single request -> Eastmoney)."""
+        try:
+            legu = _retry(
+                lambda: ak_call("stock_market_activity_legu"),
+                retries=2,
+                label="stock_market_activity_legu",
+            )
+            breadth = parse_legu_activity(legu)
+            if breadth is not None and breadth.total > 0:
+                return breadth
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Legu market activity failed, fallback to Eastmoney: %s", exc)
+
         try:
             df = _retry(
-                lambda: ak.stock_zh_a_spot_em(),  # type: ignore[attr-defined]
-                retries=2,
+                lambda: ak_call("stock_zh_a_spot_em"),
+                retries=1,
                 label="stock_zh_a_spot_em",
             )
             if df is None or df.empty:
                 return MarketBreadth()
 
             pct = pd.to_numeric(df["涨跌幅"], errors="coerce").dropna()
-            advancing = int((pct > 0).sum())
-            declining = int((pct < 0).sum())
-            unchanged = int((pct == 0).sum())
-            limit_up = int((pct >= 9.9).sum())
-            limit_down = int((pct <= -9.9).sum())
-
             total_turnover = None
             if "成交额" in df.columns:
                 total_turnover = float(
                     pd.to_numeric(df["成交额"], errors="coerce").fillna(0.0).sum()
                 )
-
             return MarketBreadth(
-                advancing=advancing,
-                declining=declining,
-                unchanged=unchanged,
-                limit_up=limit_up,
-                limit_down=limit_down,
+                advancing=int((pct > 0).sum()),
+                declining=int((pct < 0).sum()),
+                unchanged=int((pct == 0).sum()),
+                limit_up=int((pct >= 9.9).sum()),
+                limit_down=int((pct <= -9.9).sum()),
                 total_turnover=total_turnover,
             )
         except Exception as exc:  # noqa: BLE001
@@ -457,17 +519,16 @@ class AKShareDataFetcher:
             logger.warning("Market breadth fetch failed: %s", exc)
             return MarketBreadth()
 
-    def _fetch_sector_flows(
-        self, ak: object, warnings: List[str]
-    ) -> SectorFlowSummary:
+    # ------------------------------------------------------------------ #
+    # 行业 / 概念资金流向
+    # ------------------------------------------------------------------ #
+    def fetch_sector_flows(self, warnings: List[str]) -> SectorFlowSummary:
         """Fetch industry and concept capital flows (top inflow & outflow)."""
         top_n = self.settings.sector_top_n
-        ind_in, ind_out = self._fetch_single_sector_dimension(
-            ak, "行业资金流", top_n, warnings
-        )
-        con_in, con_out = self._fetch_single_sector_dimension(
-            ak, "概念资金流", top_n, warnings
-        )
+        ind_all = self.fetch_sector_dimension("行业资金流", warnings)
+        con_all = self.fetch_sector_dimension("概念资金流", warnings)
+        ind_in, ind_out = split_top_inflow_outflow(ind_all, top_n)
+        con_in, con_out = split_top_inflow_outflow(con_all, top_n)
         return SectorFlowSummary(
             industry_inflow_top=ind_in,
             industry_outflow_top=ind_out,
@@ -475,75 +536,108 @@ class AKShareDataFetcher:
             concept_outflow_top=con_out,
         )
 
-    def _fetch_single_sector_dimension(
-        self,
-        ak: object,
-        sector_type: str,
-        top_n: int,
-        warnings: List[str],
-    ) -> Tuple[List[SectorFlowItem], List[SectorFlowItem]]:
+    def fetch_sector_dimension(
+        self, sector_type: str, warnings: List[str]
+    ) -> List[SectorFlowItem]:
+        """Return all boards of one dimension (Eastmoney -> THS fallback)."""
         try:
             df = _retry(
-                lambda: ak.stock_sector_fund_flow_rank(  # type: ignore[attr-defined]
-                    indicator="今日", sector_type=sector_type
+                lambda: ak_call(
+                    "stock_fund_flow_sector_rank_em",
+                    indicator="今日",
+                    sector_type=sector_type,
                 ),
                 retries=2,
-                label=f"sector_flow({sector_type})",
+                label=f"sector_rank_em({sector_type})",
             )
-            if df is None or df.empty:
-                return [], []
-
-            name_col = self._pick_col(df, ["名称", "行业", "板块名称"])
-            pct_col = self._pick_col(df, ["今日涨跌幅", "涨跌幅"])
-            inflow_col = self._pick_col(
-                df, ["今日主力净流入-净额", "主力净流入-净额", "净额"]
-            )
-            ratio_col = self._pick_col(
-                df, ["今日主力净流入-净占比", "主力净流入-净占比", "净占比"]
-            )
-            leader_col = self._pick_col(
-                df, ["今日主力净流入最大股", "领涨股", "主力净流入最大股"]
-            )
-
-            if not name_col or not inflow_col:
-                warnings.append(f"{sector_type} 字段结构变更，无法解析资金流向")
-                return [], []
-
-            items: List[SectorFlowItem] = []
-            for _, row in df.iterrows():
-                name = str(row.get(name_col, "")).strip()
-                if not name:
-                    continue
-                items.append(
-                    SectorFlowItem(
-                        name=name,
-                        change_pct=round(_to_float(row.get(pct_col)), 2)
-                        if pct_col
-                        else 0.0,
-                        net_inflow=round(
-                            parse_chinese_amount_to_yi(row.get(inflow_col)), 2
-                        ),
-                        net_inflow_ratio=round(_to_float(row.get(ratio_col)), 2)
-                        if ratio_col
-                        else None,
-                        leader_stock=str(row.get(leader_col, "")).strip()
-                        if leader_col
-                        else "",
-                    )
-                )
-
-            items_sorted = sorted(items, key=lambda x: x.net_inflow, reverse=True)
-            inflow_top = items_sorted[:top_n]
-            outflow_top = sorted(items, key=lambda x: x.net_inflow)[:top_n]
-            return inflow_top, outflow_top
+            items = parse_sector_flow_df(df)
+            if items:
+                return items
         except Exception as exc:  # noqa: BLE001
-            warnings.append(f"{sector_type} 获取失败: {exc}")
-            logger.warning("Sector flow fetch failed (%s): %s", sector_type, exc)
-            return [], []
+            logger.warning("Eastmoney %s failed, fallback to THS: %s", sector_type, exc)
 
-    @staticmethod
-    def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-        for col in candidates:
-            if col in df.columns:
-                return col
+        ths_api = (
+            "stock_fund_flow_industry_ths"
+            if sector_type == "行业资金流"
+            else "stock_fund_flow_concept_ths"
+        )
+        try:
+            df = _retry(
+                lambda: ak_call(ths_api, symbol="即时"),
+                retries=2,
+                label=ths_api,
+            )
+            items = parse_sector_flow_df(df)
+            if not items:
+                warnings.append(f"{sector_type} 字段结构变更，无法解析资金流向")
+            return items
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"{sector_type}（东方财富/同花顺）均获取失败: {exc}")
+            logger.warning("THS sector flow fetch failed (%s): %s", sector_type, exc)
+            return []
+
+
+def pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    """Return the first candidate column present in ``df``."""
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def parse_legu_activity(df: pd.DataFrame) -> Optional[MarketBreadth]:
+    """Parse Legu ``stock_market_activity_legu`` item/value table into breadth."""
+    if df is None or df.empty or "item" not in df.columns:
         return None
+    values = {str(r["item"]).strip(): r["value"] for _, r in df.iterrows()}
+    breadth = MarketBreadth(
+        advancing=int(_to_float(values.get("上涨"))),
+        declining=int(_to_float(values.get("下跌"))),
+        unchanged=int(_to_float(values.get("平盘"))),
+        limit_up=int(_to_float(values.get("涨停"))),
+        limit_down=int(_to_float(values.get("跌停"))),
+    )
+    activity = values.get("活跃度")
+    if activity is not None:
+        breadth.activity_pct = _to_float(activity, default=0.0) or None
+    return breadth
+
+
+def parse_sector_flow_df(df: pd.DataFrame) -> List[SectorFlowItem]:
+    """Parse Eastmoney or THS sector fund-flow tables into SectorFlowItem list."""
+    if df is None or df.empty:
+        return []
+    name_col = pick_col(df, ["名称", "行业", "板块名称", "概念"])
+    pct_col = pick_col(df, ["今日涨跌幅", "涨跌幅", "行业-涨跌幅", "概念-涨跌幅"])
+    inflow_col = pick_col(df, ["今日主力净流入-净额", "主力净流入-净额", "净额"])
+    ratio_col = pick_col(df, ["今日主力净流入-净占比", "主力净流入-净占比", "净占比"])
+    leader_col = pick_col(df, ["今日主力净流入最大股", "领涨股", "主力净流入最大股"])
+    if not name_col or not inflow_col:
+        return []
+
+    items: List[SectorFlowItem] = []
+    for _, row in df.iterrows():
+        name = str(row.get(name_col, "")).strip()
+        if not name:
+            continue
+        items.append(
+            SectorFlowItem(
+                name=name,
+                change_pct=round(_to_float(row.get(pct_col)), 2) if pct_col else 0.0,
+                net_inflow=round(parse_chinese_amount_to_yi(row.get(inflow_col)), 2),
+                net_inflow_ratio=round(_to_float(row.get(ratio_col)), 2)
+                if ratio_col
+                else None,
+                leader_stock=str(row.get(leader_col, "")).strip() if leader_col else "",
+            )
+        )
+    return items
+
+
+def split_top_inflow_outflow(
+    items: List[SectorFlowItem], top_n: int
+) -> Tuple[List[SectorFlowItem], List[SectorFlowItem]]:
+    """Top-N net inflow boards and top-N net outflow boards."""
+    inflow = sorted(items, key=lambda x: x.net_inflow, reverse=True)[:top_n]
+    outflow = sorted(items, key=lambda x: x.net_inflow)[:top_n]
+    return inflow, outflow

@@ -7,7 +7,15 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 from .models import (
+    CapitalFlowOverview,
+    DailyReview,
+    GoldQuote,
+    GoldSnapshot,
     IndexSnapshot,
+    LhbItem,
+    LhbReview,
+    LimitPoolStats,
+    LimitStockItem,
     MarketBreadth,
     MarketSnapshot,
     SectorFlowItem,
@@ -371,6 +379,218 @@ def build_mock_snapshot(
         indices=indices,
         breadth=breadth,
         sector_flows=sector_flows,
+        is_mock=True,
+        warnings=[],
+    )
+
+
+def build_mock_daily_review(
+    scenario: MockScenario = "normal",
+    timezone: str = "Asia/Shanghai",
+    now: datetime | None = None,
+) -> DailyReview:
+    """Generate a realistic mock DailyReview for --job review --mock testing."""
+    from .daily_review import compute_sentiment
+
+    tz = ZoneInfo(timezone)
+    ts = now if now is not None else datetime.now(tz)
+    market = build_mock_snapshot(scenario=scenario, timezone=timezone, now=ts)
+
+    if scenario == "surge":
+        pool = LimitPoolStats(
+            limit_up_count=112,
+            broken_count=18,
+            limit_down_count=4,
+            max_boards=6,
+            seal_rate=round(112 / (112 + 18), 4),
+            prev_limit_up_avg_pct=4.35,
+            board_ladder=[
+                LimitStockItem("002197", "证通电子", 10.01, 6, "算力", "封单3.20亿"),
+                LimitStockItem("603019", "中科曙光", 10.00, 4, "半导体", "封单5.80亿"),
+                LimitStockItem("002415", "海康威视", 9.98, 3, "AI应用", "封单2.10亿"),
+                LimitStockItem("300496", "中科创达", 20.00, 2, "软件开发", "封单1.65亿"),
+            ],
+            top_industries=["半导体(14)", "软件开发(11)", "通信设备(9)", "证券(7)", "电池(6)"],
+            available=True,
+        )
+        capital = CapitalFlowOverview(
+            main_net_inflow=286.50,
+            main_net_inflow_source="东方财富",
+            southbound_net_buy=64.20,
+            margin_balance=11385.40,
+            margin_change=92.60,
+            margin_date=ts.strftime("%Y%m%d"),
+        )
+    elif scenario == "plunge":
+        pool = LimitPoolStats(
+            limit_up_count=18,
+            broken_count=42,
+            limit_down_count=64,
+            max_boards=2,
+            seal_rate=round(18 / (18 + 42), 4),
+            prev_limit_up_avg_pct=-3.12,
+            board_ladder=[
+                LimitStockItem("600988", "赤峰黄金", 10.01, 2, "贵金属", "封单1.40亿"),
+            ],
+            top_industries=["贵金属(5)", "公用事业(3)", "银行(2)"],
+            available=True,
+        )
+        capital = CapitalFlowOverview(
+            main_net_inflow=-412.80,
+            main_net_inflow_source="东方财富",
+            southbound_net_buy=-38.50,
+            margin_balance=11210.00,
+            margin_change=-85.40,
+            margin_date=ts.strftime("%Y%m%d"),
+        )
+    else:
+        pool = LimitPoolStats(
+            limit_up_count=65,
+            broken_count=24,
+            limit_down_count=8,
+            max_boards=4,
+            seal_rate=round(65 / (65 + 24), 4),
+            prev_limit_up_avg_pct=1.82,
+            board_ladder=[
+                LimitStockItem("002197", "证通电子", 9.98, 4, "计算机设备", "封单1.85亿"),
+                LimitStockItem("002565", "顺灏股份", 10.05, 3, "包装印刷", "封单2.11亿"),
+                LimitStockItem("300308", "中际旭创", 10.00, 2, "通信设备", "封单3.40亿"),
+            ],
+            top_industries=["通信设备(8)", "半导体(7)", "消费电子(6)", "汽车整车(5)", "医药商业(4)"],
+            available=True,
+        )
+        capital = CapitalFlowOverview(
+            main_net_inflow=-42.30,
+            main_net_inflow_source="同花顺行业汇总",
+            southbound_net_buy=32.45,
+            margin_balance=11277.04,
+            margin_change=-18.59,
+            margin_date=ts.strftime("%Y%m%d"),
+        )
+
+    hot_stocks = [
+        LimitStockItem("300059", "东方财富", 3.25 if scenario == "surge" else 0.45, extra="人气第1"),
+        LimitStockItem("688981", "中芯国际", 4.18 if scenario == "surge" else 1.20, extra="人气第2"),
+        LimitStockItem("688256", "寒武纪", 5.60 if scenario == "surge" else -0.80, extra="人气第3"),
+        LimitStockItem("300308", "中际旭创", 2.94 if scenario == "surge" else 1.82, extra="人气第4"),
+        LimitStockItem("002594", "比亚迪", 1.80 if scenario == "surge" else 1.18, extra="人气第5"),
+    ]
+
+    return DailyReview(
+        trade_date=ts.strftime("%Y-%m-%d"),
+        timestamp=ts,
+        market=market,
+        limit_pool=pool,
+        capital=capital,
+        hot_stocks=hot_stocks,
+        sentiment=compute_sentiment(market, pool),
+        is_mock=True,
+        warnings=[],
+    )
+
+
+def build_mock_lhb_review(
+    timezone: str = "Asia/Shanghai",
+    now: datetime | None = None,
+) -> LhbReview:
+    """Generate a realistic mock dragon-tiger list (龙虎榜) review."""
+    tz = ZoneInfo(timezone)
+    ts = now if now is not None else datetime.now(tz)
+    return LhbReview(
+        trade_date=ts.strftime("%Y-%m-%d"),
+        timestamp=ts,
+        total_count=58,
+        institution_buy_count=19,
+        net_buy_top=[
+            LhbItem("300308", "中际旭创", 11.42, 4.86, "日涨幅偏离值达7%", "3家机构买入"),
+            LhbItem("688256", "寒武纪", 9.85, 3.42, "日换手率达20%", "2家机构买入"),
+            LhbItem("002197", "证通电子", 9.98, 1.65, "连续三个交易日涨幅偏离值达20%", "知名游资主买"),
+            LhbItem("300496", "中科创达", 14.20, 1.28, "日涨幅偏离值达7%", "1家机构买入"),
+            LhbItem("002415", "海康威视", 8.50, 0.94, "日涨幅偏离值达7%", "深股通+机构买入"),
+        ],
+        net_sell_top=[
+            LhbItem("000530", "冰山冷热", -6.45, -1.94, "日换手率达20%", "机构净卖出"),
+            LhbItem("605378", "野马电池", -10.01, -1.32, "日跌幅偏离值达7%", "游资撤离"),
+            LhbItem("002148", "北纬科技", -4.80, -0.88, "日振幅值达15%", "高位获利盘兑现"),
+        ],
+        is_mock=True,
+        warnings=[],
+    )
+
+
+def build_mock_gold_snapshot(
+    scenario: MockScenario = "normal",
+    timezone: str = "Asia/Shanghai",
+    now: datetime | None = None,
+) -> GoldSnapshot:
+    """Generate realistic mock gold quotes for normal, surge, or plunge."""
+    tz = ZoneInfo(timezone)
+    ts = now if now is not None else datetime.now(tz)
+    usd_cny = 6.6610
+    qtime = ts.strftime("%Y-%m-%d %H:%M:%S")
+
+    if scenario == "surge":
+        au_price, au_chg, au_30m = 782.40, 2.45, 1.35
+        comex_price, comex_chg, comex_30m = 3685.50, 2.52, 1.40
+        london_price, london_chg, london_30m = 3658.20, 2.38, 1.28
+    elif scenario == "plunge":
+        au_price, au_chg, au_30m = 744.80, -2.30, -1.25
+        comex_price, comex_chg, comex_30m = 3492.40, -2.42, -1.32
+        london_price, london_chg, london_30m = 3468.10, -2.28, -1.18
+    else:
+        au_price, au_chg, au_30m = 766.00, 0.42, 0.18
+        comex_price, comex_chg, comex_30m = 3600.85, 0.55, 0.22
+        london_price, london_chg, london_30m = 3575.99, 0.38, 0.15
+
+    comex_cny = round(comex_price * usd_cny / 31.1034768, 2)
+    london_cny = round(london_price * usd_cny / 31.1034768, 2)
+    premium = round(au_price - london_cny, 2)
+
+    return GoldSnapshot(
+        timestamp=ts,
+        quotes=[
+            GoldQuote(
+                key="AU9999",
+                name="上海金 Au99.99",
+                price=au_price,
+                unit="元/克",
+                prev_close=round(au_price / (1 + au_chg / 100.0), 2),
+                change_pct=au_chg,
+                high=round(au_price * 1.006, 2),
+                low=round(au_price * 0.994, 2),
+                cny_per_gram=au_price,
+                change_30m_pct=au_30m,
+                quote_time=qtime,
+            ),
+            GoldQuote(
+                key="COMEX",
+                name="COMEX黄金",
+                price=comex_price,
+                unit="美元/盎司",
+                prev_close=round(comex_price / (1 + comex_chg / 100.0), 2),
+                change_pct=comex_chg,
+                high=round(comex_price * 1.008, 2),
+                low=round(comex_price * 0.992, 2),
+                cny_per_gram=comex_cny,
+                change_30m_pct=comex_30m,
+                quote_time=qtime,
+            ),
+            GoldQuote(
+                key="LONDON",
+                name="伦敦金",
+                price=london_price,
+                unit="美元/盎司",
+                prev_close=round(london_price / (1 + london_chg / 100.0), 2),
+                change_pct=london_chg,
+                high=round(london_price * 1.007, 2),
+                low=round(london_price * 0.993, 2),
+                cny_per_gram=london_cny,
+                change_30m_pct=london_30m,
+                quote_time=qtime,
+            ),
+        ],
+        usd_cny=usd_cny,
+        premium_cny_per_gram=premium,
         is_mock=True,
         warnings=[],
     )
