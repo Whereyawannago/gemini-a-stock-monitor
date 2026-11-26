@@ -1,0 +1,20 @@
+services:
+  a-stock-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: a-stock-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
+      - STATE_DIR=/app/data
+    volumes:
+      - ./data:/app/data
+    command: ["--schedule"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,25 @@
+[Unit]
+Description=A-Share Half-Hour Intelligent Stock Monitor (AKShare + MiniMax + Feishu)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/gemini-a-stock-monitor
+EnvironmentFile=/opt/gemini-a-stock-monitor/.env
+Environment=TZ=Asia/Shanghai
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/gemini-a-stock-monitor/.venv/bin/stock-monitor --schedule
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+# 安全加固（按需调整）
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

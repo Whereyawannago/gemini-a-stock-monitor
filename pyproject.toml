@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gemini-a-stock-monitor"
+version = "1.0.0"
+description = "A股半小时智能盯盘程序：AKShare实时监控、量化预警、MiniMax大模型解盘与飞书交互卡片推送"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "akshare>=1.14.0",
+    "pandas>=2.1.0",
+    "numpy>=1.26.0",
+    "openai>=1.40.0",
+    "requests>=2.31.0",
+    "APScheduler>=3.10.4",
+    "python-dotenv>=1.0.1",
+    "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-mock>=3.14.0",
+]
+
+[project.scripts]
+stock-monitor = "stock_monitor.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v"
